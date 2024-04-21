@@ -10,6 +10,7 @@ import (
 	"net"
 
 	"github.com/swagftw/rex"
+	"github.com/swagftw/rex/utils"
 )
 
 var daemonAddr = "0.0.0.0:8080"
@@ -36,8 +37,12 @@ func main() {
 		return
 	}
 
+	msgChan := make(chan []byte, 10)
+
+	go processMsg(msgChan)
+
 	for {
-		err = readConnection(reader)
+		err = readConnection(reader, msgChan)
 		if errors.Is(err, io.EOF) {
 			return
 		}
@@ -45,9 +50,45 @@ func main() {
 }
 
 func registerClient(conn net.Conn) error {
-	err := writeToConn(conn, []byte("REX REGISTER\r\n"))
+	buf := new(bytes.Buffer)
+
+	buf.WriteString("REX REGISTER\r\n")
+	utils.GetRexReqBody(buf)
+
+	_, err := conn.Write(buf.Bytes())
 	if err != nil {
+		slog.Error("failed to send client registered message", "err", err)
+
 		return err
+	}
+
+	buf.Reset()
+
+	reader := bufio.NewReader(conn)
+	emptyLinesFound := 0
+
+	for {
+		if emptyLinesFound == 2 {
+			if bytes.HasPrefix(buf.Bytes(), []byte("REX REGISTER")) {
+				break
+			}
+
+			emptyLinesFound = 0
+		}
+
+		// wait till the client is registered
+		bytesData, err := reader.ReadBytes('\n')
+		if err != nil {
+			slog.Error("failed to read the bytes", "err", err)
+
+			return err
+		}
+
+		buf.Write(bytesData)
+
+		if bytes.Equal(bytesData, []byte{'\r', '\n'}) {
+			emptyLinesFound++
+		}
 	}
 
 	slog.Info("registered client")
@@ -55,8 +96,20 @@ func registerClient(conn net.Conn) error {
 	return nil
 }
 
-func readConnection(reader *bufio.Reader) error {
+func readConnection(reader *bufio.Reader, msgChan chan []byte) error {
+	buf := &bytes.Buffer{}
+
+	emptyLinesFound := 0
+
 	for {
+		// end of the message
+		if emptyLinesFound == 2 {
+			msgChan <- buf.Bytes()
+			buf.Reset()
+			emptyLinesFound = 0
+		}
+
+		// read line
 		byteData, err := reader.ReadBytes('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -70,29 +123,20 @@ func readConnection(reader *bufio.Reader) error {
 			return err
 		}
 
-		// end of the message
-		if bytes.Equal(byteData, []byte{'\r', '\n', '\r', '\n'}) {
-			break
-		}
+		buf.Write(byteData)
 
-		// check if the message is "ping"
-		if bytes.HasPrefix(byteData, []byte("REX PING")) {
+		// end of the message
+		if bytes.Equal(byteData, []byte{'\r', '\n'}) {
+			emptyLinesFound++
+
 			continue
 		}
 	}
-
-	return nil
 }
 
-func writeToConn(conn net.Conn, data []byte) error {
-	data = append(data, []byte{'\r', '\n'}...)
-
-	_, err := conn.Write(data)
-	if err != nil {
-		slog.Error("failed to write data", "err", err)
-
-		return err
+func processMsg(msgChan chan []byte) {
+	for msg := range msgChan {
+		bytes.CutSuffix(msg, []byte{'\r', '\n', '\r', '\n'})
+		slog.Info("received message", "msg", string(msg))
 	}
-
-	return nil
 }

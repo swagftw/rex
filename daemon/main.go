@@ -38,7 +38,7 @@ func main() {
 		}
 	}()
 
-	addr := net.JoinHostPort("127.0.0.2", fmt.Sprintf("%d", port))
+	addr := net.JoinHostPort("0.0.0.0", fmt.Sprintf("%d", port))
 	listener, err := server.StartListener(addr)
 	if err != nil {
 		return

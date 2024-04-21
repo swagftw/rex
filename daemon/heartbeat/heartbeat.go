@@ -3,7 +3,6 @@ package heartbeat
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,9 +11,7 @@ import (
 	"sync"
 	"time"
 
-	gonanoid "github.com/matoous/go-nanoid"
-
-	"github.com/swagftw/rex/types"
+	"github.com/swagftw/rex/utils"
 )
 
 var port = 8080
@@ -44,6 +41,7 @@ func StartHeartbeat() error {
 	}
 
 	var conn net.Conn
+	msgChan := make(chan []byte, 10)
 
 	for {
 		conn, err = listener.Accept()
@@ -99,10 +97,19 @@ func StartHeartbeat() error {
 
 			reader := bufio.NewReader(conn)
 
-			for {
-				var buf []byte
+			buf := &bytes.Buffer{}
 
-				buf, err = reader.ReadBytes('\n')
+			emptyLinesFound := 0
+
+			for {
+				// end of the message
+				if emptyLinesFound == 2 {
+					msgChan <- buf.Bytes()
+					buf.Reset()
+					emptyLinesFound = 0
+				}
+
+				bytesData, err := reader.ReadBytes('\n')
 				if err != nil {
 					if errors.Is(err, io.EOF) {
 						return
@@ -113,27 +120,13 @@ func StartHeartbeat() error {
 					return
 				}
 
-				bytes.TrimSuffix(buf, []byte{'\r'})
+				buf.Write(bytesData)
 
-				cd := new(types.Data)
-
-				err = json.Unmarshal(buf, cd)
-				if err != nil {
-					slog.Error("failed to unmarshal the bytes", "err", err)
+				// check for empty line
+				if bytes.Equal(bytesData, []byte{'\r', '\n'}) {
+					emptyLinesFound++
 
 					continue
-				}
-
-				switch cd.Type {
-				case types.RegisterClient:
-					err = registerClient(conn)
-					if err != nil {
-						return
-					}
-				case types.Close:
-					return
-				default:
-					slog.Error("unknown type", "type", cd.Type)
 				}
 			}
 		}(conn)
@@ -141,29 +134,13 @@ func StartHeartbeat() error {
 }
 
 func PingClient(conn net.Conn) error {
-	data := types.Data{
-		Type: types.HeartbeatPing,
-	}
-
 	buf := &bytes.Buffer{}
 
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		slog.Error("failed to marshal data", "err", err)
+	buf.WriteString("REX PING\r\n")
 
-		return err
-	}
+	utils.GetRexReqBody(buf)
 
-	err = json.Compact(buf, jsonData)
-	if err != nil {
-		slog.Error("failed to compact data", "err", err)
-
-		return err
-	}
-
-	buf.WriteByte('\n')
-
-	_, err = conn.Write(buf.Bytes())
+	_, err := conn.Write(buf.Bytes())
 	if err != nil {
 		if errors.Is(err, net.ErrClosed) {
 			return err
@@ -179,40 +156,43 @@ func PingClient(conn net.Conn) error {
 	return nil
 }
 
+func handleConnMsg(conn net.Conn, msgChan chan []byte) {
+	time.Sleep(time.Second)
+	for msg := range msgChan {
+		if bytes.HasPrefix(msg, []byte("REX REGISTER")) {
+			err := registerClient(conn)
+			if err != nil {
+				return
+			}
+
+			continue
+		}
+	}
+}
+
 func registerClient(conn net.Conn) error {
 	addr := conn.RemoteAddr().String()
 
 	slog.Info("client connected", "addr", addr)
 
-	id := generateID()
+	id := utils.GenerateID()
 
-	ActiveClients.Store(id, conn)
+	// ActiveClients.Store(id, conn)
 
-	data := &types.Data{
-		Type: types.RegisterClient,
-	}
+	buf := &bytes.Buffer{}
 
-	jsonBytes, err := json.Marshal(data)
+	buf.WriteString("REX REGISTER")
+	buf.WriteByte(' ')
+	buf.WriteString(id)
+
+	utils.GetRexReqBody(buf)
+
+	_, err := conn.Write(buf.Bytes())
 	if err != nil {
-		slog.Error("failed to marshal data", "err", err)
-
-		return err
-	}
-
-	jsonBytes = append(jsonBytes, []byte{'\r', '\n'}...)
-
-	_, err = conn.Write(jsonBytes)
-	if err != nil {
-		slog.Error("failed to write data", "err", err)
+		slog.Error("failed to send client registered message", "err", err)
 
 		return err
 	}
 
 	return nil
-}
-
-var chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
-func generateID() string {
-	return gonanoid.MustGenerate(chars, 6)
 }
