@@ -6,20 +6,30 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
+
+	gonanoid "github.com/matoous/go-nanoid"
 
 	"github.com/swagftw/rex/types"
 )
 
 var port = 8080
 
+var ActiveClients = sync.Map{}
+var clientLock = sync.RWMutex{}
+
 func StartListener() (net.Listener, error) {
-	slog.Info("starting listener...", "port", port)
-	listener, err := net.Listen("tcp", "0.0.0.0:"+fmt.Sprintf("%d", port))
+	slog.Info("starting heartbeat...", "port", port)
+
+	hostPort := net.JoinHostPort("0.0.0.0", fmt.Sprintf("%d", port))
+
+	listener, err := net.Listen("tcp", hostPort)
 	if err != nil {
-		slog.Error("failed to start listener", "err", err)
+		slog.Error("failed to start heartbeat", "err", err)
 
 		return nil, err
 	}
@@ -43,10 +53,12 @@ func StartHeartbeat() error {
 			continue
 		}
 
-		// write ping messages to the client
-		ticker := time.NewTicker(time.Second * 2)
+		go func(conn net.Conn) {
+			// write ping messages to the client
+			ticker := time.NewTicker(time.Second * 2)
 
-		go func(conn net.Conn, ticker *time.Ticker) {
+			defer ticker.Stop()
+
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("panic: while sending ping", "err", r)
@@ -62,42 +74,15 @@ func StartHeartbeat() error {
 
 			for {
 				if <-ticker.C; true {
-					data := types.Data{
-						Type: types.HeartbeatPing,
-					}
-
-					buf := &bytes.Buffer{}
-
-					jsonData, err := json.Marshal(data)
+					err = PingClient(conn)
 					if err != nil {
-						slog.Error("failed to marshal data", "err", err)
-
-						panic(err)
-					}
-
-					err = json.Compact(buf, jsonData)
-					if err != nil {
-						slog.Error("failed to compact data", "err", err)
-
-						panic(err)
-					}
-
-					buf.WriteByte('\n')
-
-					_, err = conn.Write(buf.Bytes())
-					if err != nil {
-						ticker.Stop()
-
-						slog.Error("failed to send ping", "err", err)
-
 						return
 					}
-
-					slog.Info("ping sent")
 				}
 			}
-		}(conn, ticker)
+		}(conn)
 
+		// read from connection
 		go func(conn net.Conn) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -119,18 +104,16 @@ func StartHeartbeat() error {
 
 				buf, err = reader.ReadBytes('\n')
 				if err != nil {
-					slog.Error("failed to read the bytes", "err", err)
-
-					if errors.Is(err, net.ErrClosed) {
+					if errors.Is(err, io.EOF) {
 						return
 					}
+
+					slog.Error("failed to read the bytes", "err", err)
 
 					return
 				}
 
-				if len(buf) < 1 || buf[0] == '\n' {
-					continue
-				}
+				bytes.TrimSuffix(buf, []byte{'\r'})
 
 				cd := new(types.Data)
 
@@ -142,10 +125,11 @@ func StartHeartbeat() error {
 				}
 
 				switch cd.Type {
-				case types.HeartbeatPong:
-					slog.Info("pong received")
 				case types.RegisterClient:
-					registerClient(cd)
+					err = registerClient(conn)
+					if err != nil {
+						return
+					}
 				case types.Close:
 					return
 				default:
@@ -156,6 +140,79 @@ func StartHeartbeat() error {
 	}
 }
 
-func registerClient(cd *types.Data) {
-	slog.Info("client registered", "data", cd)
+func PingClient(conn net.Conn) error {
+	data := types.Data{
+		Type: types.HeartbeatPing,
+	}
+
+	buf := &bytes.Buffer{}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		slog.Error("failed to marshal data", "err", err)
+
+		return err
+	}
+
+	err = json.Compact(buf, jsonData)
+	if err != nil {
+		slog.Error("failed to compact data", "err", err)
+
+		return err
+	}
+
+	buf.WriteByte('\n')
+
+	_, err = conn.Write(buf.Bytes())
+	if err != nil {
+		if errors.Is(err, net.ErrClosed) {
+			return err
+		}
+
+		slog.Error("failed to send ping", "err", err)
+
+		return err
+	}
+
+	slog.Debug("ping sent")
+
+	return nil
+}
+
+func registerClient(conn net.Conn) error {
+	addr := conn.RemoteAddr().String()
+
+	slog.Info("client connected", "addr", addr)
+
+	id := generateID()
+
+	ActiveClients.Store(id, conn)
+
+	data := &types.Data{
+		Type: types.RegisterClient,
+	}
+
+	jsonBytes, err := json.Marshal(data)
+	if err != nil {
+		slog.Error("failed to marshal data", "err", err)
+
+		return err
+	}
+
+	jsonBytes = append(jsonBytes, []byte{'\r', '\n'}...)
+
+	_, err = conn.Write(jsonBytes)
+	if err != nil {
+		slog.Error("failed to write data", "err", err)
+
+		return err
+	}
+
+	return nil
+}
+
+var chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+func generateID() string {
+	return gonanoid.MustGenerate(chars, 6)
 }

@@ -3,23 +3,22 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"log/slog"
 	"net"
 
-	"github.com/swagftw/rex/types"
+	"github.com/swagftw/rex"
 )
 
 var daemonAddr = "0.0.0.0:8080"
 
 func main() {
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("panic: while running client", "err", r)
-		}
-	}()
+	verbose := flag.Bool("verbose", false, "verbose logging")
+
+	flag.Parse()
+	rex.InitLogger(*verbose)
 
 	conn, err := net.Dial("tcp", daemonAddr)
 	if err != nil {
@@ -30,83 +29,70 @@ func main() {
 
 	slog.Info("connected to the daemon")
 
+	reader := bufio.NewReader(conn)
+
+	err = registerClient(conn)
+	if err != nil {
+		return
+	}
+
 	for {
-		// check if the connection is still alive
-		_, err = conn.Write([]byte{'\n'})
-		if err != nil {
-			slog.Error("connection is not alive", "err", err)
-
-			return
-		}
-
-		reader := bufio.NewReader(conn)
-
-		err = readConnection(conn, reader)
+		err = readConnection(reader)
 		if errors.Is(err, io.EOF) {
 			return
 		}
 	}
 }
 
-func readConnection(conn net.Conn, reader *bufio.Reader) error {
-	byteData, err := reader.ReadBytes('\n')
+func registerClient(conn net.Conn) error {
+	err := writeToConn(conn, []byte("REX REGISTER\r\n"))
 	if err != nil {
-		if errors.Is(err, io.EOF) {
-			slog.Error("connection closed", "err", err)
+		return err
+	}
+
+	slog.Info("registered client")
+
+	return nil
+}
+
+func readConnection(reader *bufio.Reader) error {
+	for {
+		byteData, err := reader.ReadBytes('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				slog.Debug("connection closed", "err", err)
+
+				return err
+			}
+
+			slog.Error("failed to read data", "err", err)
 
 			return err
 		}
 
-		slog.Error("failed to read data", "err", err)
+		// end of the message
+		if bytes.Equal(byteData, []byte{'\r', '\n', '\r', '\n'}) {
+			break
+		}
 
-		return err
+		// check if the message is "ping"
+		if bytes.HasPrefix(byteData, []byte("REX PING")) {
+			continue
+		}
 	}
 
-	data := new(types.Data)
-	err = json.Unmarshal(byteData, data)
-	if err != nil {
-		slog.Error("failed to unmarshal data", "err", err)
+	return nil
+}
 
-		return nil
-	}
+func writeToConn(conn net.Conn, data []byte) error {
+	data = append(data, []byte{'\r', '\n'}...)
 
-	if data.Type != types.HeartbeatPing {
-		return nil
-	}
-
-	slog.Info("ping received")
-
-	data = &types.Data{
-
-		Type: types.HeartbeatPong,
-	}
-
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		slog.Error("failed to marshal data", "err", err)
-
-		return nil
-	}
-
-	buf := new(bytes.Buffer)
-
-	err = json.Compact(buf, jsonData)
-	if err != nil {
-		slog.Error("failed to compact data", "err", err)
-
-		return nil
-	}
-
-	buf.WriteByte('\n')
-
-	_, err = conn.Write(buf.Bytes())
+	_, err := conn.Write(data)
 	if err != nil {
 		slog.Error("failed to write data", "err", err)
 
-		return nil
+		return err
 	}
-
-	slog.Info("pong sent")
 
 	return nil
 }
